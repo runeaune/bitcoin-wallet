@@ -12,11 +12,11 @@ import (
 	"time"
 
 	"github.com/aarbt/bitcoin-network"
-	"github.com/aarbt/hdkeys"
-	"github.com/aarbt/mnemonic"
 	"github.com/aarbt/bitcoin-wallet/database"
 	"github.com/aarbt/bitcoin-wallet/inventory"
 	"github.com/aarbt/bitcoin-wallet/wallet"
+	"github.com/aarbt/hdkeys"
+	"github.com/aarbt/mnemonic"
 )
 
 var peerFile = flag.String("peerfile", "",
@@ -51,11 +51,12 @@ func main() {
 	config := inventory.Config{
 		// TODO Set database path from parameter.
 		Database: database.Open(),
+		Network:  n,
 	}
 	if *walletSeed != "" {
 		seed := mnemonic.SeedFromWordsPassword(
 			strings.Split(*walletSeed, " "), "")
-		key := hdkeys.NewPrivateKey(seed)
+		key := hdkeys.NewMasterKey(seed)
 		config.Wallet = wallet.New(key)
 	}
 	i := inventory.New(&config)
@@ -65,13 +66,11 @@ func main() {
 
 	d := network.NewDispatcher(output)
 	i.Subscribe(d)
-	i.SetSendChannel(n.SendChannel())
 	d.Run()
 	i.Run()
 
-	// TODO Trigger this on first connection established.
 	go func() {
-		time.Sleep(10 * time.Second)
+		<-i.Connected()
 		i.GetRecentMerkleBlocks(500)
 	}()
 	go func() {
