@@ -21,9 +21,27 @@ import (
 
 var kHighestKnownBlock = []byte("last header")
 
+type Inventory struct {
+	input        chan network.Message
+	output       chan<- network.Message
+	data         map[string]*Data
+	closeCh      chan struct{}
+	doneCh       chan struct{}
+	bestEndpoint string
+	filter       *Filter
+	config       *Config
+	outputs      map[string]*TxOutput
+	headers      *HeaderGetter
+
+	connEstablished chan struct{}
+	connected       bool
+	confedEndpoints map[string]bool
+}
+
 type Config struct {
 	Wallet   *wallet.Wallet
 	Database *database.DB
+	Network  Network
 }
 
 type TxOutput struct {
@@ -49,28 +67,31 @@ func (out *TxOutput) TxHash() []byte {
 	return out.data.Hash
 }
 
-type Inventory struct {
-	input        chan network.Message
-	output       chan<- network.Message
-	data         map[string]*Data
-	closeCh      chan struct{}
-	doneCh       chan struct{}
-	bestEndpoint string
-	filter       *Filter
-	config       *Config
-	outputs      map[string]*TxOutput
+type Network interface {
+	SendChannel() chan<- network.Message
+	EndpointMisbehaving(string, int, string)
+	EndpointsByQuality() []string
+	Connected() chan struct{}
 }
 
 func New(config *Config) *Inventory {
 	inv := Inventory{
 		// TODO figure out a better way to avoid dropping messages.
-		input:   make(chan network.Message, 2000),
-		closeCh: make(chan struct{}),
-		doneCh:  make(chan struct{}),
-		outputs: make(map[string]*TxOutput),
-		filter:  NewFilter(),
-		config:  config,
+		input:           make(chan network.Message, 2000),
+		closeCh:         make(chan struct{}),
+		doneCh:          make(chan struct{}),
+		outputs:         make(map[string]*TxOutput),
+		filter:          NewFilter(),
+		config:          config,
+		connEstablished: make(chan struct{}),
+		confedEndpoints: make(map[string]bool),
 	}
+
+	if config == nil || config.Network == nil {
+		log.Printf("Requires a network.")
+		return nil
+	}
+	inv.output = config.Network.SendChannel()
 
 	// Add objects relevant to the wallet to our filter.
 	if config.Wallet != nil {
@@ -84,7 +105,7 @@ func New(config *Config) *Inventory {
 	}
 
 	// Load known transactions from database.
-	if config != nil && config.Database != nil {
+	if config.Database != nil {
 		inv.data = LoadTransactions(config.Database)
 
 		// TODO Remove spent transactions.
@@ -99,7 +120,15 @@ func New(config *Config) *Inventory {
 			inv.UpdateTxOutputs(data)
 		}
 	}
+
+	inv.headers = GetHeaders(&inv, config.Database)
 	return &inv
+}
+
+// Connected returns a channel that closes once an initial connection has been
+// established.
+func (inv *Inventory) Connected() chan struct{} {
+	return inv.connEstablished
 }
 
 // UnspentTransactions returns a list of the current unspent transactions in
@@ -176,9 +205,6 @@ func (inv *Inventory) Close() {
 	close(inv.closeCh)
 	<-inv.doneCh
 }
-func (inv *Inventory) SetSendChannel(output chan<- network.Message) {
-	inv.output = output
-}
 
 type dispatcher interface {
 	Subscribe(string, chan<- network.Message)
@@ -187,11 +213,12 @@ type dispatcher interface {
 
 func (inv *Inventory) Subscribe(d dispatcher) {
 	d.Subscribe("block", inv.input)
-	d.Subscribe("headers", inv.input)
 	d.Subscribe("inv", inv.input)
 	d.Subscribe("merkleblock", inv.input)
 	d.Subscribe("tx", inv.input)
 	d.Subscribe("version", inv.input)
+
+	d.Subscribe("headers", inv.headers.Input())
 }
 
 func (inv *Inventory) Unsubscribe(d dispatcher) {
@@ -239,107 +266,28 @@ func (inv *Inventory) addDataToInventory(hash []byte,
 	return data
 }
 
-func (inv *Inventory) getHeader(hash []byte) *messages.ExtendedHeader {
-	header := &messages.ExtendedHeader{}
-	err := inv.config.Database.Get(hash, header)
-	if err != nil {
-		log.Printf("Getting header failed: %v", err)
-		return nil
-	}
-	return header
-}
-
-func (inv *Inventory) setHeight(m *messages.ExtendedHeader) (uint, error) {
-	prev := inv.getHeader(m.PrevBlock)
-	if prev != nil {
-		m.Height = prev.Height + 1
-		return m.Height, nil
-	} else {
-		block0, _ := hex.DecodeString(
-			"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-		if bytes.Equal(m.PrevBlock, utils.ReverseBytes(block0)) {
-			m.Height = 1
-			return 1, nil
-		}
-		return 0, fmt.Errorf("Couldn't find prev block.")
-	}
-}
-
-type databaseBlockHeight struct {
-	Hash   []byte
-	Height uint
-}
-
-func (inv *Inventory) highestKnownBlock() ([]byte, uint) {
-	// TODO store in memory if no database is set.
-	db := inv.config.Database
-	last := databaseBlockHeight{}
-	err := db.Get(kHighestKnownBlock, &last)
-	if err != nil {
-		log.Printf("Couldn't retrieve highest known block: %v", err)
-		return make([]byte, 32), 0
-	}
-	return last.Hash, last.Height
-}
-
-func (inv *Inventory) setHighestKnownBlock(hash []byte, height uint) {
-	inv.config.Database.Set(kHighestKnownBlock, databaseBlockHeight{
-		Hash:   hash,
-		Height: height,
-	})
-}
-
-func (inv *Inventory) getMoreHeaders() {
-	hash, height := inv.highestKnownBlock()
-	msg := messages.GetBlocks{
-		Version:  70001,
-		HashStop: make([]byte, 32),
-		Locators: [][]byte{hash},
-	}
-	loc := hash
-	// Add 20 recent known headers with larger and larger gaps between them
-	// as they get less recent (up to a step of 40 between the two least
-	// recent ones.)
-	for i := 0; i < 20 && loc != nil; i++ {
-		for j := 0; j < i*2; j++ {
-			header := inv.getHeader(loc)
-			if header == nil {
-				loc = nil
-				break
-			}
-			loc = header.PrevBlock
-		}
-		if loc != nil {
-			msg.Locators = append(msg.Locators, loc)
-		}
-	}
-	var msgBytes bytes.Buffer
-	msg.Serialize(&msgBytes)
-	inv.Send(network.Message{
-		Type: "getheaders",
-		Data: msgBytes.Bytes(),
-	})
-	log.Printf("Getting more headers, starting from %x at height %d.\n",
-		utils.ReverseBytes(hash), height)
-}
-
-func (inv *Inventory) Send(m network.Message) {
+func (inv *Inventory) Send(m network.Message) string {
 	// TODO This function should send a message to a single endpoint (the
 	// one perceived to be "best"), but if no response is received within a
 	// few seconds, it should move on and try the next one on the list
 	// (updating the ratings of the first one).
-	if inv.bestEndpoint != "" {
-		m.Endpoint = inv.bestEndpoint
-		inv.output <- m
-	} else {
-		log.Printf("Trying to Send without having a best endpoint set.")
+	endpoints := inv.config.Network.EndpointsByQuality()
+	for _, endpoint := range endpoints {
+		if _, found := inv.confedEndpoints[endpoint]; found {
+			m.Endpoint = endpoint
+			inv.output <- m
+			return endpoint
+		}
 	}
+	log.Printf("Trying to Send, but there are no configured endpoints.")
+	return ""
 }
 
+// TODO Add headergetter function getting N most recent headers.
 func (inv *Inventory) GetRecentMerkleBlocks(count int) error {
 	// TODO avoid races with fetches of new blocks and updates of the
 	// height.
-	hash, height := inv.highestKnownBlock()
+	hash, height := inv.headers.highestKnownBlock()
 	log.Printf("Fetching merkle blocks from height %d, and back %d blocks.",
 		height, count)
 	var vector messages.InventoryVector
@@ -349,7 +297,7 @@ func (inv *Inventory) GetRecentMerkleBlocks(count int) error {
 			Type: messages.TypeMsgFilteredBlock,
 			Hash: loc,
 		})
-		header := inv.getHeader(loc)
+		header := inv.headers.loadHeader(loc)
 		if header == nil {
 			break
 		}
@@ -366,51 +314,13 @@ func (inv *Inventory) GetRecentMerkleBlocks(count int) error {
 	return nil
 }
 
-func (inv *Inventory) handleHeaders(m network.Message) {
-	_, oldHeight := inv.highestKnownBlock()
-	headers, err := messages.ParseHeaders(m.Data)
-	if err != nil {
-		log.Printf("Failed to parse headers: %v", err)
-		return
-	}
-	log.Printf("Received %d headers from %s.\n",
-		len(headers), m.Endpoint)
-	var hash []byte
-	var height uint
-	var vector messages.InventoryVector
-	for _, h := range headers {
-		height, err = inv.setHeight(h)
-		if err != nil {
-			log.Printf("Received bad header %x from %s.",
-				utils.ReverseBytes(h.Hash()), m.Endpoint)
-			// TODO break connection.
-			break
-		}
-		hash = h.Hash()
-		inv.config.Database.Set(hash, h)
-		vector = append(vector, &messages.Inventory{
-			Type: messages.TypeMsgFilteredBlock,
-			Hash: hash,
-		})
-	}
-	if len(hash) != 0 && height > oldHeight {
-		inv.setHighestKnownBlock(hash, height)
-		log.Printf("Last header updated to %x (internal byte order), height is %d.",
-			utils.ReverseBytes(hash), height)
-	}
-	if len(headers) >= 2000 {
-		inv.getMoreHeaders()
-	}
-	if len(vector) > 0 {
-		data, err := messages.EncodeInventoryVector(vector)
-		if err != nil {
-			log.Printf("Failed to encode getdata vector: %v", err)
-			return
-		}
-		inv.Send(network.Message{
-			Type: "getdata",
-			Data: data,
-		})
+// reportMisbehaviour makes the network layer aware that an endpoint did
+// something bad. This will usually result in the endpoint being disconnected.
+func (inv *Inventory) reportMisbehaviour(endpoint string, score int, desc string) {
+	if inv.config.Network != nil {
+		log.Printf("Reporting endpoint misbehaviour: endpoint %q: %s\n",
+			endpoint, desc)
+		inv.config.Network.EndpointMisbehaving(endpoint, score, desc)
 	}
 }
 
@@ -431,21 +341,22 @@ func (inv *Inventory) handleInvMessage(m network.Message) {
 	// Request data for unknown inventory objects.
 	var vector messages.InventoryVector
 	for _, i := range v {
-		// We don't need to ask for blocks, as
-		// we'll get the relevant transactions
-		// in merkleblocks.
-		if i.Type != messages.TypeMsgTX {
-			// TODO Request block header and merkleblock here.
-			return
+		if i.Type == messages.TypeMsgTX {
+			hash := string(i.Hash)
+			data, found := inv.data[hash]
+			if !found {
+				data = NewData(i.Hash)
+				inv.data[hash] = data
+				vector = append(vector, i)
+			}
+			data.AddPeer(m.Endpoint)
+		} else if i.Type == messages.TypeMsgBlock {
+			extHeader := inv.headers.loadHeader(i.Hash)
+			if extHeader == nil {
+				i.Type = messages.TypeMsgFilteredBlock
+				vector = append(vector, i)
+			}
 		}
-		hash := string(i.Hash)
-		data, found := inv.data[hash]
-		if !found {
-			data = NewData(i.Hash)
-			inv.data[hash] = data
-			vector = append(vector, i)
-		}
-		data.AddPeer(m.Endpoint)
 	}
 	data, err := messages.EncodeInventoryVector(vector)
 	if err != nil {
@@ -469,9 +380,13 @@ func (inv *Inventory) handleVersionMessage(m network.Message) {
 			Type:     "mempool",
 			Endpoint: m.Endpoint,
 		}
-		if inv.bestEndpoint == "" {
-			inv.bestEndpoint = m.Endpoint
-			inv.getMoreHeaders()
+		// TODO Consider delaying this until we're sure the filter is actually set.
+		inv.confedEndpoints[m.Endpoint] = true
+
+		// First connection established, report as connected.
+		if !inv.connected {
+			close(inv.connEstablished)
+			inv.connected = true
 		}
 	}
 }
@@ -501,7 +416,7 @@ func (inv *Inventory) handleMerkleBlock(m network.Message) {
 			panic(fmt.Sprintf("TotalTXs %d, Flags %x",
 				block.TotalTXs, block.Flags))
 		}
-		extHeader := inv.getHeader(block.Hash())
+		extHeader := inv.headers.loadHeader(block.Hash())
 		short := database.Block{
 			Hash:      block.Hash(),
 			Timestamp: time.Unix(int64(block.Timestamp), 0),
@@ -520,6 +435,7 @@ func (inv *Inventory) Run() {
 		for {
 			select {
 			case _ = <-inv.closeCh:
+				inv.headers.Close()
 				inv.config.Database.Close()
 				close(inv.doneCh)
 				return
@@ -539,8 +455,6 @@ func (inv *Inventory) Run() {
 					} else {
 						inv.handleTransaction(tx)
 					}
-				case "headers":
-					inv.handleHeaders(m)
 				case "merkleblock":
 					inv.handleMerkleBlock(m)
 				default:
