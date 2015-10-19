@@ -46,7 +46,8 @@ type BlockHeader struct {
 	Bits       uint32
 	Nonce      uint32
 
-	hash []byte // not in protocol message.
+	hash   []byte // not in protocol message.
+	Height int    // not in protocol message.
 }
 
 func (h *BlockHeader) Serialize(w io.Writer) error {
@@ -88,10 +89,9 @@ func (h *BlockHeader) Hash() []byte {
 
 type ExtendedHeader struct {
 	BlockHeader
-	Count        uint
-	data         []byte    // not in protocol message.
-	Height       uint      // not in protocol message.
-	FetchedBlock time.Time // not in protocol message.
+	Count uint
+
+	data []byte // not in protocol message.
 }
 
 func (h *ExtendedHeader) Data() []byte {
