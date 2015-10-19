@@ -32,7 +32,7 @@ type Transaction struct {
 
 	// The following parameters are calculated locally and are not in
 	// protocol messages.
-	Hash []byte
+	hash []byte
 	data []byte
 }
 
@@ -40,7 +40,21 @@ type Transaction struct {
 // include the signature (or other things that can be changed after broadcast).
 func (t *Transaction) Fingerprint() string {
 	// TODO Actually disregard signature when making the fingerprint.
-	return hex.EncodeToString(t.Hash)
+	return hex.EncodeToString(t.Hash())
+}
+
+func (t *Transaction) Data() []byte {
+	if t.data == nil {
+		t.data = t.Serialize()
+	}
+	return t.data
+}
+
+func (t *Transaction) Hash() []byte {
+	if t.hash == nil {
+		t.hash = utils.DoubleHash(t.Data())
+	}
+	return t.hash
 }
 
 func (t *Transaction) InputTransactions() [][]byte {
@@ -52,7 +66,7 @@ func (t *Transaction) InputTransactions() [][]byte {
 }
 
 func (t *Transaction) HashInternal() string {
-	r := utils.ReverseBytes(t.Hash)
+	r := utils.ReverseBytes(t.Hash())
 	return fmt.Sprintf("%x (internal byte order)", r)
 }
 
@@ -143,10 +157,10 @@ func (t *Transaction) SignSerialize(signInput int, subscript []byte, hashCode ui
 }
 
 func (t *Transaction) MatchesFilter(filter *FilterLoad) bool {
-	if filter.MayContain(t.Hash) {
+	if filter.MayContain(t.Hash()) {
 		return true
 	}
-	if filter.MayContain(utils.ReverseBytes(t.Hash)) {
+	if filter.MayContain(utils.ReverseBytes(t.Hash())) {
 		log.Printf("Tx matched reverse hash: %x", t.Hash)
 		return true
 	}
@@ -164,14 +178,15 @@ func (t *Transaction) MatchesFilter(filter *FilterLoad) bool {
 }
 
 func (t *Transaction) String() string {
-	str := fmt.Sprintf("%x, version %d\n",
-		utils.ReverseBytes(t.Hash), t.Version)
+	str := fmt.Sprintf("%x, version %d\n\n",
+		utils.ReverseBytes(t.Hash()), t.Version)
 	for _, i := range t.Inputs {
-		str += fmt.Sprintf("%s\n", i)
+		str += fmt.Sprintf("%s\n\n", i)
 	}
 	for _, o := range t.Outputs {
 		str += fmt.Sprintf("%s\n", o)
 	}
+	str += fmt.Sprintf("\n")
 	if t.LockTime == 0 {
 		str += fmt.Sprintf("Unlocked.")
 	} else {
@@ -206,16 +221,17 @@ func (i *TxInput) MatchesFilter(filter *FilterLoad) bool {
 
 func (i *TxInput) String() string {
 	os := script.ParseScriptObject(i.Signature)
-	str := fmt.Sprintf("Input: %s", i.PreviousOutput)
+	str := fmt.Sprintf("Input: tx %s", i.PreviousOutput)
 	if len(os) == 2 {
 		hash := utils.RIPEMD160Hash(os[1].Data())
 		addr, err := base58.BitcoinCheckEncode(
 			base58.BitcoinPublicKeyHashPrefix, hash)
 		if err != nil {
-			str += fmt.Sprintf(" %x %x", os[0].Data(), hash)
+			str += fmt.Sprintf(" => %x", hash)
 		} else {
-			str += fmt.Sprintf(" %x %s", os[0].Data(), addr)
+			str += fmt.Sprintf(" => %s", addr)
 		}
+		str += fmt.Sprintf("\n  Signature: %x", os[0].Data())
 	}
 	return str
 }
@@ -293,7 +309,7 @@ type OutPoint struct {
 }
 
 func (p OutPoint) String() string {
-	return fmt.Sprintf("%x (%d)", utils.ReverseBytes(p.Hash), p.Index)
+	return fmt.Sprintf("%x (output index %d)", utils.ReverseBytes(p.Hash), p.Index)
 }
 
 func (p *OutPoint) Serialize() []byte {
@@ -346,7 +362,8 @@ var NilOutput = TxOutput{
 }
 
 func (o *TxOutput) String() string {
-	return fmt.Sprintf("Paying %d satoshis to %s", o.Value, script.ParseScript(o.Script))
+	return fmt.Sprintf("Output: %d satoshis (%f mBTC) to script: %s",
+		o.Value, float64(o.Value)/1e5, script.ParseScript(o.Script))
 }
 
 func (o *TxOutput) MatchesFilter(filter *FilterLoad) bool {
@@ -378,7 +395,7 @@ func (o TxOutput) AddressHash() []byte {
 // TxHash returns the hash of the transaction the output is a part of.
 func (o TxOutput) TxHash() []byte {
 	if o.tx != nil {
-		return o.tx.Hash
+		return o.tx.Hash()
 	} else {
 		return []byte{0x00}
 	}
@@ -458,7 +475,7 @@ func ParseCoinbaseTransactionFromStream(input io.Reader) (*Transaction, error) {
 	// Complete hash calculation and add it to the transaction.
 	first := hasher.Sum(nil)
 	hash := sha256.Sum256(first[:])
-	t.Hash = hash[:]
+	t.hash = hash[:]
 	return t, nil
 }
 
@@ -473,7 +490,7 @@ func ParseTransactionFromStream(input io.Reader) (*Transaction, error) {
 	}
 
 	t.data = data.Bytes()
-	t.Hash = utils.DoubleHash(t.data)
+	t.hash = utils.DoubleHash(t.data)
 	return t, nil
 }
 
@@ -484,6 +501,6 @@ func ParseTransaction(data []byte) (*Transaction, error) {
 		return nil, err
 	}
 	t.data = data
-	t.Hash = utils.DoubleHash(data)
+	t.hash = utils.DoubleHash(data)
 	return t, nil
 }
