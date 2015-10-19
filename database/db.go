@@ -11,6 +11,8 @@ import (
 	"github.com/golang/leveldb"
 )
 
+const kTxStoragePrefix = "TX: "
+
 // TODO Compress storage format. Speed up by using batching.
 
 type DB struct {
@@ -66,7 +68,7 @@ func (db *DB) LoadAllTransactions() []*Transaction {
 	var list []*Transaction
 	db.transactionCount = 0
 	for {
-		key := fmt.Sprintf("TX:%x", db.transactionCount)
+		key := fmt.Sprintf(kTxStoragePrefix+"%x", db.transactionCount)
 		data, err := db.db.Get([]byte(key), nil)
 		if err != nil || len(data) == 0 {
 			log.Printf("Transaction #%d not in storage: %v",
@@ -86,7 +88,7 @@ func (db *DB) LoadAllTransactions() []*Transaction {
 // is to update transactions after the fact, duplicates storage of the same
 // transaction is fine as long as they are incrementally more complete/correct.
 func (db *DB) StoreNewTransaction(tx *Transaction) {
-	key := fmt.Sprintf("TX:%x", db.transactionCount)
+	key := fmt.Sprintf(kTxStoragePrefix+"%x", db.transactionCount)
 	err := db.db.Set([]byte(key), tx.Serialize(), nil)
 	if err != nil {
 		log.Printf("Failed to insert transaction %x into database: %v",
@@ -99,7 +101,7 @@ func (db *DB) StoreNewTransaction(tx *Transaction) {
 type Block struct {
 	Hash      []byte    // 32 bytes
 	Timestamp time.Time // 4 bytes
-	Height    uint32    // 4 bytes
+	Height    int32     // 4 bytes
 }
 
 func (b *Block) Serialize() []byte {
