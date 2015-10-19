@@ -19,7 +19,6 @@ type HeaderGetter struct {
 	output chan *messages.ExtendedHeader
 	db     *database.DB
 
-	closing bool
 	closeCh chan struct{}
 	doneCh  chan struct{}
 }
@@ -39,20 +38,26 @@ func GetHeaders(inv *Inventory, db *database.DB) *HeaderGetter {
 // Close shuts down the header getter. It is guaranteed to not read or write to
 // any channels after Close returns.
 func (getter *HeaderGetter) Close() {
-	getter.closing = true
 	close(getter.closeCh)
 	<-getter.doneCh
 }
 
 func (getter *HeaderGetter) Run() {
 	go func() {
-		for !getter.closing {
+		var closing bool
+		for !closing {
+			timer := time.NewTimer(2 * time.Minute)
 			incomplete := getter.requestMoreHeaders()
-			if getter.closing {
-				break
-			}
 			if !incomplete {
-				time.Sleep(10 * time.Second)
+				// We shouldn't need to poll for headers very
+				// often as blocks are broadcast by miners.
+				select {
+				case <-timer.C:
+					//nothing
+				case <-getter.closeCh:
+					closing = true
+					break
+				}
 			}
 		}
 		close(getter.doneCh)
@@ -65,17 +70,16 @@ func (getter *HeaderGetter) Input() chan<- network.Message {
 	return getter.input
 }
 
-func (getter *HeaderGetter) loadHeader(hash []byte) *messages.ExtendedHeader {
+func (getter *HeaderGetter) loadHeader(hash []byte) (*messages.ExtendedHeader, error) {
 	header := &messages.ExtendedHeader{}
 	err := getter.db.Get(hash, header)
 	if err != nil {
-		log.Printf("Getting header failed: %v", err)
-		return nil
+		return nil, fmt.Errorf("Loading header failed: %v", err)
 	}
-	return header
+	return header, nil
 }
 
-func (getter *HeaderGetter) setHighestKnownBlock(hash []byte, height uint) {
+func (getter *HeaderGetter) setHighestKnownBlock(hash []byte, height int) {
 	getter.db.Set(kHighestKnownBlock, databaseBlockHeight{
 		Hash:   hash,
 		Height: height,
@@ -84,10 +88,10 @@ func (getter *HeaderGetter) setHighestKnownBlock(hash []byte, height uint) {
 
 type databaseBlockHeight struct {
 	Hash   []byte
-	Height uint
+	Height int
 }
 
-func (getter *HeaderGetter) highestKnownBlock() ([]byte, uint) {
+func (getter *HeaderGetter) highestKnownBlock() ([]byte, int) {
 	// TODO read from memory if no database is set.
 	last := databaseBlockHeight{}
 	err := getter.db.Get(kHighestKnownBlock, &last)
@@ -111,8 +115,10 @@ func (getter *HeaderGetter) formGetHeaderMessage() network.Message {
 	// recent ones.)
 	for i := 0; i < 20 && loc != nil; i++ {
 		for j := 0; j < i*2; j++ {
-			header := getter.loadHeader(loc)
-			if header == nil {
+			header, err := getter.loadHeader(loc)
+			if err != nil {
+				log.Printf("Failed to get recent header, %d steps back: %v",
+					i, err)
 				loc = nil
 				break
 			}
@@ -175,20 +181,17 @@ func (getter *HeaderGetter) requestMoreHeaders() bool {
 	return incomplete
 }
 
-func (getter *HeaderGetter) setMessageHeight(m *messages.ExtendedHeader) (uint, error) {
-	prev := getter.loadHeader(m.PrevBlock)
-	if prev != nil {
-		m.Height = prev.Height + 1
-		return m.Height, nil
-	} else {
+func (getter *HeaderGetter) getBlockHeight(hash []byte) (int, error) {
+	prev, err := getter.loadHeader(hash)
+	if err != nil {
 		block0, _ := hex.DecodeString(
 			"000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f")
-		if bytes.Equal(m.PrevBlock, utils.ReverseBytes(block0)) {
-			m.Height = 1
-			return 1, nil
+		if bytes.Equal(hash, utils.ReverseBytes(block0)) {
+			return 0, nil
 		}
-		return 0, fmt.Errorf("Couldn't find prev block.")
+		return -1, fmt.Errorf("Couldn't find prev block.")
 	}
+	return int(prev.Height), nil
 }
 
 func (getter *HeaderGetter) handleHeaders(m network.Message) bool {
@@ -201,20 +204,22 @@ func (getter *HeaderGetter) handleHeaders(m network.Message) bool {
 	log.Printf("Received %d headers from %s.\n",
 		len(headers), m.Endpoint)
 	var hash []byte
-	var height uint
+	var height int
 	var incomplete bool
 	var vector messages.InventoryVector
 	for _, h := range headers {
-		height, err = getter.setMessageHeight(h)
+		prevHeight, err := getter.getBlockHeight(h.PrevBlock)
 		if err != nil {
 			log.Printf("Received bad header %x from %s.",
 				utils.ReverseBytes(h.Hash()), m.Endpoint)
 			// TODO handle this
-			getter.inv.reportMisbehaviour(m.Endpoint, 10,
+			getter.inv.reportMisbehaviour(m.Endpoint, 20,
 				"Sent bad block header.")
 			incomplete = true
 			break
 		}
+		height = prevHeight + 1
+		h.Height = height
 		hash = h.Hash()
 		getter.db.Set(hash, h)
 
@@ -228,29 +233,21 @@ func (getter *HeaderGetter) handleHeaders(m network.Message) bool {
 		getter.setHighestKnownBlock(hash, height)
 		log.Printf("Last header updated to %x (internal byte order), height is %d.",
 			utils.ReverseBytes(hash), height)
-		if height < oldHeight+uint(len(vector)) {
+		if height < oldHeight+len(vector) {
 			// TODO not all blocks are new, consider changing endpoint.
 		}
 	} else {
-		getter.inv.reportMisbehaviour(m.Endpoint, 10,
-			"No new headers in received message.")
-		incomplete = true
+		// TODO If we haven't caught up yet, this means the endpoint is
+		// misbehaving.
 	}
 	if len(headers) >= 2000 {
 		incomplete = true
 	} else {
 		// TODO question if endpoint is good.
 	}
-	if len(vector) > 0 {
-		data, err := messages.EncodeInventoryVector(vector)
-		if err != nil {
-			log.Printf("Failed to encode getdata vector: %v", err)
-			return true
-		}
-		getter.inv.Send(network.Message{
-			Type: "getdata",
-			Data: data,
-		})
+	err = getter.inv.SendGetData(vector, m.Endpoint)
+	if err != nil {
+		return true
 	}
 	return incomplete
 }
