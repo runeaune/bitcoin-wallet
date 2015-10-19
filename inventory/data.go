@@ -20,10 +20,12 @@ func LoadTransactions(db *database.DB) map[string]*Data {
 			log.Printf("Error loading transaction #%d: %v", i, err)
 			continue
 		}
-		data := NewData(tx.Hash)
-		data.Block = t.Block
+		data := NewData(tx.Hash())
+		if t.Block.Height > 0 {
+			data.Block = t.Block
+		}
 		data.TX = tx
-		inv[string(tx.Hash)] = data
+		inv[string(tx.Hash())] = data
 		log.Printf("Loaded transaction: %v", data)
 	}
 	return inv

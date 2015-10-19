@@ -39,6 +39,11 @@ func (f Filter) String() string {
 		len(f.local), f.lookups, f.matches, f.falsePositives)
 }
 
+const (
+	filterNoUpdateNeeded = false
+	filterMayNeedUpdate  = true
+)
+
 func (f *Filter) Watch(data []byte, mayNeedUpdate bool) {
 	f.remote.AddData(data)
 	// TODO only set this flag if the filter actually changed.
@@ -51,6 +56,10 @@ func (f *Filter) Watch(data []byte, mayNeedUpdate bool) {
 
 func (f *Filter) RemoteUpdateNeeded() bool {
 	return f.remoteUpdate
+}
+
+func (f *Filter) Filter() *messages.FilterLoad {
+	return f.remote
 }
 
 func (f *Filter) RemoteData() []byte {
