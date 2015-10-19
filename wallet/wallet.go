@@ -17,12 +17,15 @@ type Wallet struct {
 
 func New(root *hdkeys.Key) *Wallet {
 	// TODO support more than one account.
-	k, err := root.Chain("m/44'/0'/0'")
-	if err != nil {
-		panic(fmt.Sprintf("Child derivation failed: %v", err))
-	}
+	//k, err := root.Chain("m/44'/0'/0'")
+	//if err != nil {
+	//	panic(fmt.Sprintf("Child derivation failed: %v", err))
+	//}
 	w := Wallet{}
-	a, err := NewAccount(k.SerializeEncode())
+	//a, err := NewAccount(k.SerializeEncode())
+	seed := "xprv9z29aRLQo4Gkn2z7XczXBDup2Nig8EvDCXV7wub6FnSe36UkakkEfTN4TZH9obaPj" +
+		"7yn4Zh5P1JSRvnfXAi6riG9g8WqrZjzenkU9MHxy6g"
+	a, err := NewAccount(seed)
 	if err != nil {
 		panic(fmt.Sprintf("Account creation failed: %v", err))
 	}
@@ -41,12 +44,29 @@ func (w *Wallet) SetTxInventory(inv UnspentTxOutputter) {
 	w.accounts[0].SetTxInventory(inv)
 }
 
+func (w *Wallet) MarkAddressAsUsed(hash []byte) {
+	for _, a := range w.accounts {
+		a.MarkAddressAsUsed(hash)
+	}
+}
+
 func (w *Wallet) WatchObjects() [][]byte {
 	var list [][]byte
 	for _, a := range w.accounts {
 		list = append(list, a.WatchObjects()...)
 	}
 	return list
+}
+
+func (w *Wallet) HasNewAddressesToWatch() bool {
+	var b bool
+	// TODO Potentially add watch of new accounts here.
+	for _, a := range w.accounts {
+		if a.HasNewAddressesToWatch() {
+			b = true
+		}
+	}
+	return b
 }
 
 func (wallet *Wallet) ServeHTTP(w http.ResponseWriter, r *http.Request) {

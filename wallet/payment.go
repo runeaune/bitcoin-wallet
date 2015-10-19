@@ -3,10 +3,10 @@ package wallet
 import (
 	"fmt"
 
-	"github.com/aarbt/hdkeys"
 	"github.com/aarbt/bitcoin-wallet/messages"
 	"github.com/aarbt/bitcoin-wallet/script"
 	"github.com/aarbt/bitcoin-wallet/utils"
+	"github.com/aarbt/hdkeys"
 )
 
 type Payment struct {
@@ -17,6 +17,10 @@ type Payment struct {
 
 func (p *Payment) Transaction() *messages.Transaction {
 	return p.tx
+}
+
+func (p *Payment) Serialize() []byte {
+	return p.tx.Serialize()
 }
 
 // AddInputsAndFee to payment adds spendable inputs from the account until
@@ -58,20 +62,25 @@ func (p *Payment) AddInputsAndFee(fee uint64) error {
 	if total > required {
 		// Add change output for the excess satoshis.
 		change := a.NextChangeAddress()
-		tx.AddOutput(&messages.TxOutput{
-			Value:  total - required,
-			Script: script.PayToPubKeyHash(change),
-		})
+		err := p.AddOutput(change, total-required)
+		if err != nil {
+			return fmt.Errorf("Failed to add change output: %v", err)
+		}
 	}
 	return nil
 }
 
 // AddOutputToPayment adds a standard pay to public key hash output to a payment transaction.
-func (p *Payment) AddOutput(addrHash []byte, value uint64) {
+func (p *Payment) AddOutput(addrHash []byte, value uint64) error {
+	s, err := script.PayToPubKeyHash(addrHash)
+	if err != nil {
+		return err
+	}
 	p.tx.AddOutput(&messages.TxOutput{
 		Value:  value,
-		Script: script.PayToPubKeyHash(addrHash),
+		Script: s,
 	})
+	return nil
 }
 
 // Sign all the inputs of the payment transaction.
