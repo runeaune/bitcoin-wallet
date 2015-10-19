@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-
 	"fmt"
 	"golang.org/x/crypto/ripemd160"
 
@@ -426,9 +425,10 @@ func ParseStandard(s []byte) []byte {
 	return s[3:23]
 }
 
-func PayToPubKeyHash(hash []byte) []byte {
+func PayToPubKeyHash(hash []byte) ([]byte, error) {
 	if len(hash) != 20 {
-		panic("Unexpected length")
+		return nil, fmt.Errorf("Hash %x has unexpected length: %d",
+			hash, len(hash))
 	}
 	s := make([]byte, 25)
 	s[0] = OP_DUP
@@ -437,7 +437,7 @@ func PayToPubKeyHash(hash []byte) []byte {
 	copy(s[3:23], hash)
 	s[23] = OP_EQUALVERIFY
 	s[24] = OP_CHECKSIG
-	return s
+	return s, nil
 }
 
 func SigScriptEncode(sig, pubKey []byte) []byte {
