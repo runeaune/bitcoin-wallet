@@ -15,6 +15,7 @@ import (
 	"github.com/aarbt/bitcoin-network"
 	"github.com/aarbt/bitcoin-wallet/database"
 	"github.com/aarbt/bitcoin-wallet/messages"
+	"github.com/aarbt/bitcoin-wallet/script"
 	"github.com/aarbt/bitcoin-wallet/utils"
 	"github.com/aarbt/bitcoin-wallet/wallet"
 )
@@ -93,31 +94,40 @@ func New(config *Config) *Inventory {
 	}
 	inv.output = config.Network.SendChannel()
 
-	// Add objects relevant to the wallet to our filter.
-	if config.Wallet != nil {
-		w := config.Wallet.WatchObjects()
-		for _, o := range w {
-			encoded, _ := base58.BitcoinCheckEncode(
-				base58.BitcoinPublicKeyHashPrefix, o)
-			log.Printf("Watching %x %s", o, encoded)
-			inv.filter.Watch(o, true)
+	// Loop until all addresses have been added to the filter. This might
+	// need more than one round in situations where the database contains
+	// transactions to addresses near the end of the initial address list.
+	needLoading := true
+	for needLoading {
+		// Add objects relevant to the wallet to our filter.
+		if config.Wallet != nil {
+			for _, o := range config.Wallet.WatchObjects() {
+				encoded, _ := base58.BitcoinCheckEncode(
+					base58.BitcoinPublicKeyHashPrefix, o)
+				log.Printf("Watching %x %s", o, encoded)
+				inv.filter.Watch(o, filterMayNeedUpdate)
+			}
 		}
-	}
 
-	// Load known transactions from database.
-	if config.Database != nil {
-		inv.data = LoadTransactions(config.Database)
+		// Load known transactions from database.
+		if config.Database != nil {
+			inv.data = LoadTransactions(config.Database)
 
-		// TODO Remove spent transactions.
-
-		// Add the transactions we're watching to the filter.
-		for hash, _ := range inv.data {
-			inv.filter.Watch([]byte(hash), true)
+			// Add the transactions we're watching to the filter.
+			for hash, _ := range inv.data {
+				inv.filter.Watch([]byte(hash), filterMayNeedUpdate)
+			}
+			// Create/update list of unspent tx outputs. This relies on the
+			// filter being up-to-date.
+			for _, data := range inv.data {
+				// This might add new addresses to wallet.
+				inv.UpdateTxOutputs(data)
+			}
 		}
-		// Create/update list of unspent tx outputs. This relies on the
-		// filter to be up-to-date.
-		for _, data := range inv.data {
-			inv.UpdateTxOutputs(data)
+		if config.Wallet != nil {
+			needLoading = config.Wallet.HasNewAddressesToWatch()
+		} else {
+			needLoading = false
 		}
 	}
 
@@ -146,7 +156,8 @@ func (inv *Inventory) UnspentTxOutputs() []*messages.TxOutput {
 }
 
 // UpdateTxOutputs updates the list of unspent transaction outputs Inventory is
-// watching.
+// watching. It also alerts attached wallets about new transaction to aid their
+// discovery process.
 func (inv *Inventory) UpdateTxOutputs(data *Data) {
 	// TODO protect against races.
 	tx := data.TX
@@ -158,7 +169,7 @@ func (inv *Inventory) UpdateTxOutputs(data *Data) {
 		out, found := inv.outputs[string(id)]
 		if found {
 			log.Printf("Output %d of tx %x spent by input %d of tx %x.",
-				prev.Index, out.TxHash(), index, tx.Hash)
+				prev.Index, out.TxHash(), index, tx.Hash())
 			out.spentBy = data
 		}
 	}
@@ -173,7 +184,10 @@ func (inv *Inventory) UpdateTxOutputs(data *Data) {
 				// public address hashes. Either way, it's
 				// highly likely that this is an output that we
 				// can spend, so add it to the list.
-				log.Printf("Transaction %x pays address %x", tx.Hash, addr)
+				encoded, _ := base58.BitcoinCheckEncode(
+					base58.BitcoinPublicKeyHashPrefix, addr)
+				log.Printf("Transaction %x pays address %s",
+					utils.ReverseBytes(tx.Hash()), encoded)
 				output := TxOutput{
 					index:  uint32(index),
 					output: o,
@@ -181,6 +195,10 @@ func (inv *Inventory) UpdateTxOutputs(data *Data) {
 				}
 				inv.outputs[string(output.Fingerprint())] = &output
 				outputs = append(outputs, &output)
+
+				if inv.config.Wallet != nil {
+					inv.config.Wallet.MarkAddressAsUsed(addr)
+				}
 			}
 		}
 	}
@@ -189,11 +207,14 @@ func (inv *Inventory) UpdateTxOutputs(data *Data) {
 	for _, o := range outputs {
 		for _, data := range inv.data {
 			t := data.TX
+			if t == nil {
+				continue
+			}
 			for index, i := range t.Inputs {
 				prev := i.PreviousOutput
 				if bytes.Equal(prev.Hash, o.TxHash()) && prev.Index == o.index {
 					log.Printf("Output %x(%d) already spent by input %x(%d).",
-						o.TxHash(), prev.Index, t.Hash, index)
+						o.TxHash(), prev.Index, t.Hash(), index)
 					o.spentBy = data
 				}
 			}
@@ -261,7 +282,9 @@ func (inv *Inventory) addDataToInventory(hash []byte,
 			Block: data.Block,
 		})
 	}
-	inv.filter.Watch(hash, false)
+	// Add transaction to filter. Remote nodes will do the same, so there's
+	// no need to update them.
+	inv.filter.Watch(hash, filterNoUpdateNeeded)
 	// TODO verify TX
 	return data
 }
@@ -283,6 +306,20 @@ func (inv *Inventory) Send(m network.Message) string {
 	return ""
 }
 
+func (inv *Inventory) SendGetData(vector messages.InventoryVector, addrHint string) error {
+	if len(vector) > 0 {
+		data, err := messages.EncodeInventoryVector(vector)
+		if err != nil {
+			return fmt.Errorf("Failed to encode getdata vector: %v", err)
+		}
+		inv.Send(network.Message{
+			Type: "getdata",
+			Data: data,
+		})
+	}
+	return nil
+}
+
 // TODO Add headergetter function getting N most recent headers.
 func (inv *Inventory) GetRecentMerkleBlocks(count int) error {
 	// TODO avoid races with fetches of new blocks and updates of the
@@ -292,26 +329,25 @@ func (inv *Inventory) GetRecentMerkleBlocks(count int) error {
 		height, count)
 	var vector messages.InventoryVector
 	loc := hash
+	// Add hashes of merkleblocks to vector, starting from most recent.
 	for i := 0; i < count && loc != nil; i++ {
 		vector = append(vector, &messages.Inventory{
 			Type: messages.TypeMsgFilteredBlock,
 			Hash: loc,
 		})
-		header := inv.headers.loadHeader(loc)
-		if header == nil {
+		header, err := inv.headers.loadHeader(loc)
+		if err != nil {
+			log.Printf("Failed to load previous header number %d: %v",
+				i, err)
 			break
 		}
 		loc = header.PrevBlock
 	}
-	data, err := messages.EncodeInventoryVector(vector)
-	if err != nil {
-		return fmt.Errorf("Failed to encode getdata vector: %v", err)
+	// Reverse order to get blocks in chronological order.
+	for i := 0; i < len(vector)/2; i++ {
+		vector[i], vector[len(vector)-i-1] = vector[len(vector)-i-1], vector[i]
 	}
-	inv.Send(network.Message{
-		Type: "getdata",
-		Data: data,
-	})
-	return nil
+	return inv.SendGetData(vector, "")
 }
 
 // reportMisbehaviour makes the network layer aware that an endpoint did
@@ -325,11 +361,30 @@ func (inv *Inventory) reportMisbehaviour(endpoint string, score int, desc string
 }
 
 func (inv *Inventory) handleTransaction(tx *messages.Transaction) {
-	if !inv.filter.Match(tx.Hash) {
-		log.Printf("Received transaction %x not matching the filter.", tx.Hash)
+	if !tx.MatchesFilter(inv.filter.Filter()) {
+		log.Printf("Received transaction %x not matching the filter.", tx.Hash())
 
+	} else {
+		log.Printf("Received transaction %x matching the filter: %x", tx.Hash(), tx.Data())
 	}
-	inv.addDataToInventory(tx.Hash, tx, nil)
+	inv.addDataToInventory(tx.Hash(), tx, nil)
+
+	w := inv.config.Wallet
+	if w != nil {
+		if w.HasNewAddressesToWatch() {
+			// A wallet has had its address space expand and we
+			// need to add these new addresses to the filter and
+			// unless we're certain this is a fresh transaction (as
+			// opposed to a historic one), we need to rescan
+			// history.
+			for _, o := range w.WatchObjects() {
+				inv.filter.Watch(o, filterMayNeedUpdate)
+			}
+			// TODO Decide whether or not to rescan history. This
+			// can be done easily (but slowely) by setting height
+			// back to 0.
+		}
+	}
 }
 
 func (inv *Inventory) handleInvMessage(m network.Message) {
@@ -343,6 +398,7 @@ func (inv *Inventory) handleInvMessage(m network.Message) {
 	for _, i := range v {
 		if i.Type == messages.TypeMsgTX {
 			hash := string(i.Hash)
+			log.Printf("Received inventory message with tx: %x from %q", hash, m.Endpoint)
 			data, found := inv.data[hash]
 			if !found {
 				data = NewData(i.Hash)
@@ -351,21 +407,14 @@ func (inv *Inventory) handleInvMessage(m network.Message) {
 			}
 			data.AddPeer(m.Endpoint)
 		} else if i.Type == messages.TypeMsgBlock {
-			extHeader := inv.headers.loadHeader(i.Hash)
+			extHeader, _ := inv.headers.loadHeader(i.Hash)
 			if extHeader == nil {
 				i.Type = messages.TypeMsgFilteredBlock
 				vector = append(vector, i)
 			}
 		}
 	}
-	data, err := messages.EncodeInventoryVector(vector)
-	if err != nil {
-		log.Fatalf("Failed to encode getdata vector: %v", err)
-	}
-	inv.Send(network.Message{
-		Type: "getdata",
-		Data: data,
-	})
+	inv.SendGetData(vector, m.Endpoint)
 }
 
 func (inv *Inventory) handleVersionMessage(m network.Message) {
@@ -416,11 +465,32 @@ func (inv *Inventory) handleMerkleBlock(m network.Message) {
 			panic(fmt.Sprintf("TotalTXs %d, Flags %x",
 				block.TotalTXs, block.Flags))
 		}
-		extHeader := inv.headers.loadHeader(block.Hash())
+		height, err := inv.headers.getBlockHeight(block.PrevBlock)
+		if err != nil {
+			// TODO This indicates that we're not caught up yet,
+			// which can be useful information if we're receiving
+			// short header lists from a bad node.
+			// TODO Send a getheaders request.
+			log.Printf("Couldn't figure out height of block: %v", err)
+		} else {
+			// Only store block if we known the height.
+			height += 1
+			block.Height = height
+			inv.config.Database.Set(block.Hash(), block)
+
+			log.Printf("Received Merkleheaders for block %d", height)
+			_, highest := inv.headers.highestKnownBlock()
+			if height > highest {
+				inv.headers.setHighestKnownBlock(block.Hash(), height)
+				log.Printf("Updated highest known block.")
+			}
+		}
+		// Store transactions even if we couldn't get correct height.
+		// TODO Update height value once we figure it out.
 		short := database.Block{
 			Hash:      block.Hash(),
 			Timestamp: time.Unix(int64(block.Timestamp), 0),
-			Height:    uint32(extHeader.Height),
+			Height:    int32(height),
 		}
 		// Attach block information to transactions
 		for _, tx := range root.MatchedTransactions() {
@@ -495,4 +565,44 @@ func (inv *Inventory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprintf(w, "Couldn't find TX %q.", key)
 		}
 	}
+}
+
+func (inv *Inventory) VerifyTransaction(tx *messages.Transaction) (bool, error) {
+	var inputValue, outputValue uint64
+	for index, input := range tx.Inputs {
+		stack := script.Stack{}
+		err := stack.Execute(input.Signature, nil)
+		if err != nil {
+			return false, fmt.Errorf("Failed to push signature: %v", err)
+		}
+		prev := input.PreviousOutput
+		d, found := inv.data[string(prev.Hash)]
+		if !found {
+			return false, fmt.Errorf("Input tx %x not found in map.", prev.Hash)
+		}
+		inputTx := d.TX
+		output := inputTx.Outputs[prev.Index]
+		inputValue += output.Value
+
+		data := &script.Data{
+			Hasher: func(c uint32) []byte {
+				return utils.DoubleHash(tx.SignSerialize(
+					index, output.Script, c))
+			}}
+		err = stack.Execute(output.Script, data)
+		if err != nil {
+			return false, fmt.Errorf("Failed to execute script: %v", err)
+		}
+		if !stack.CheckSuccess() {
+			return false, fmt.Errorf("Signature on input %d not valid.", index)
+		}
+	}
+	for _, output := range tx.Outputs {
+		outputValue += output.Value
+	}
+	if outputValue > inputValue {
+		return false, fmt.Errorf("Outputs have higher value (%d) than inputs (%d).",
+			outputValue, inputValue)
+	}
+	return true, nil
 }
