@@ -3,7 +3,9 @@ package wallet
 import (
 	"fmt"
 	"log"
+	"net/http"
 
+	"github.com/aarbt/bitcoin-base58"
 	"github.com/aarbt/bitcoin-wallet/messages"
 	"github.com/aarbt/hdkeys"
 )
@@ -21,10 +23,22 @@ const kAddressScanStep = 10
 
 // TODO Keep track of confirmations.
 // TODO Avoid panic on bad input.
+// TODO Add mutex to avoid races.
 
 type Address struct {
-	key  *hdkeys.Key
-	used bool
+	key        *hdkeys.Key
+	used       bool
+	spendables []*messages.TxOutput
+}
+
+// Balance returns the unspent balance in the address. Assumes UpdateBalances
+// has been called just prior.
+func (a Address) Balance() uint64 {
+	var total uint64
+	for _, s := range a.spendables {
+		total += s.Value
+	}
+	return total
 }
 
 func NewAddress(key *hdkeys.Key) *Address {
@@ -34,8 +48,8 @@ func NewAddress(key *hdkeys.Key) *Address {
 type Account struct {
 	txInventory    UnspentTxOutputter
 	addrMap        map[string]*Address
-	recvAddrList   []string
-	changeAddrList []string
+	recvAddrList   []string // refers addrMap
+	changeAddrList []string // refers addrMap
 
 	receive *hdkeys.Key
 	change  *hdkeys.Key
@@ -68,15 +82,27 @@ func (a *Account) SpendableOutputs() []spendable {
 		hash := unspent.AddressHash()
 		if hash != nil {
 			addr, found := a.addrMap[string(hash)]
+			addr.spendables = addr.spendables[:0]
 			if found {
 				list = append(list, spendable{
 					key:    addr.key,
 					output: unspent,
 				})
+				// This assumes that
+				addr.spendables = append(addr.spendables, unspent)
 			}
 		}
 	}
 	return list
+}
+
+// UpdateBalances will update the list of spendable outputs and hence the
+// balance of all active addresses.
+func (a *Account) UpdateBalances() {
+	for _, addr := range a.addrMap {
+		addr.spendables = addr.spendables[:0]
+	}
+	a.SpendableOutputs()
 }
 
 // UnusedAddresses returne the number of unused addresses at the end of the
@@ -202,7 +228,6 @@ func NewAccount(seed string) (*Account, error) {
 		return nil, fmt.Errorf("Child derivation failed: %v", err)
 	}
 
-	// TODO Add more addresses as they are consumed.
 	for j := 0; j <= 1; j++ {
 		// 0 for receive, 1 for change.
 		err := a.generateAddresses(j, kAddressInitialLimit)
@@ -211,4 +236,35 @@ func NewAccount(seed string) (*Account, error) {
 		}
 	}
 	return &a, nil
+}
+
+func (a *Account) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+	a.UpdateBalances()
+	fmt.Fprintf(w, "\n<p>Receive addresses:</p>\n")
+	for i, name := range a.recvAddrList {
+		addr := a.addrMap[name]
+		encoded, _ := base58.BitcoinCheckEncode(
+			base58.BitcoinPublicKeyHashPrefix, []byte(name))
+		// TODO get account numnber right.
+		fmt.Fprintf(w, "m/44'/0'/0'/0/%d: %s,  balance: %d\n<br>",
+			i, encoded, addr.Balance())
+		for _, output := range addr.spendables {
+			fmt.Fprintf(w, "Spendable tx output: %x (%d): %d satoshi\n<br>",
+				output.TxHash(), output.Index(), output.Value)
+		}
+	}
+	fmt.Fprintf(w, "\n<p>Change addresses:</p>\n")
+	for i, name := range a.changeAddrList {
+		addr := a.addrMap[name]
+		encoded, _ := base58.BitcoinCheckEncode(
+			base58.BitcoinPublicKeyHashPrefix, []byte(name))
+		// TODO get account numnber right.
+		fmt.Fprintf(w, "m/44'/0'/0'/1/%d: %s,  balance: %d\n<br>",
+			i, encoded, addr.Balance())
+		for _, output := range addr.spendables {
+			fmt.Fprintf(w, "Spendable tx output: %x (%d): %d satoshi\n<br>",
+				output.TxHash(), output.Index(), output.Value)
+		}
+	}
 }

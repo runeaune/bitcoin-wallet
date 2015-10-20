@@ -30,6 +30,9 @@ func New(root *hdkeys.Key) *Wallet {
 		panic(fmt.Sprintf("Account creation failed: %v", err))
 	}
 	w.accounts = append(w.accounts, a)
+
+	http.Handle("/wallet/account0", a)
+
 	return &w
 }
 
