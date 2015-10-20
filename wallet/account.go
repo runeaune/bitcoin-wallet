@@ -1,12 +1,15 @@
 package wallet
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 
 	"github.com/aarbt/bitcoin-base58"
 	"github.com/aarbt/bitcoin-wallet/messages"
+	"github.com/aarbt/bitcoin-wallet/utils"
 	"github.com/aarbt/hdkeys"
 )
 
@@ -25,10 +28,15 @@ const kAddressScanStep = 10
 // TODO Avoid panic on bad input.
 // TODO Add mutex to avoid races.
 
+type spendable struct {
+	outputs []*messages.TxOutput
+	key     *hdkeys.Key
+}
+
 type Address struct {
 	key        *hdkeys.Key
 	used       bool
-	spendables []*messages.TxOutput
+	spendables []*spendable
 }
 
 // Balance returns the unspent balance in the address. Assumes UpdateBalances
@@ -36,7 +44,7 @@ type Address struct {
 func (a Address) Balance() uint64 {
 	var total uint64
 	for _, s := range a.spendables {
-		total += s.Value
+		total += s.outputs[0].Value
 	}
 	return total
 }
@@ -67,30 +75,54 @@ func (a *Account) SetTxInventory(inv UnspentTxOutputter) {
 	a.txInventory = inv
 }
 
-type spendable struct {
-	output *messages.TxOutput
-	key    *hdkeys.Key
+type OutputsByTxHash []*messages.TxOutput
+
+func (slice OutputsByTxHash) Len() int {
+	return len(slice)
+}
+
+func (slice OutputsByTxHash) Less(i, j int) bool {
+	return bytes.Compare(slice[i].TxHash(), slice[j].TxHash()) < 0
+}
+
+func (slice OutputsByTxHash) Swap(i, j int) {
+	slice[i], slice[j] = slice[j], slice[i]
 }
 
 // SpendableOutputs reads outputs from a central storage and returns the ones
 // that are spendable by this acount.
-func (a *Account) SpendableOutputs() []spendable {
+func (a *Account) SpendableOutputs() []*spendable {
+	for _, addr := range a.addrMap {
+		addr.spendables = addr.spendables[:0]
+	}
 	orgList := a.txInventory.UnspentTxOutputs()
-	var list []spendable
+	var list []*spendable
+	// Using the map to group outputs belonging to duplicate versions of a
+	// transaction.
+	m := make(map[string]*spendable)
 	for _, unspent := range orgList {
 		// Get the address hash paid by the output.
 		hash := unspent.AddressHash()
 		if hash != nil {
 			addr, found := a.addrMap[string(hash)]
-			addr.spendables = addr.spendables[:0]
 			if found {
-				list = append(list, spendable{
-					key:    addr.key,
-					output: unspent,
-				})
-				// This assumes that
-				addr.spendables = append(addr.spendables, unspent)
+				id := string(unspent.Fingerprint())
+				s, found := m[id]
+				if !found {
+					s = &spendable{
+						key: addr.key,
+					}
+					m[id] = s
+					list = append(list, s)
+					addr.spendables = append(addr.spendables, s)
+				}
+				s.outputs = append(s.outputs, unspent)
 			}
+		}
+	}
+	for _, addr := range a.addrMap {
+		for _, spend := range addr.spendables {
+			sort.Sort(OutputsByTxHash(spend.outputs))
 		}
 	}
 	return list
@@ -99,9 +131,6 @@ func (a *Account) SpendableOutputs() []spendable {
 // UpdateBalances will update the list of spendable outputs and hence the
 // balance of all active addresses.
 func (a *Account) UpdateBalances() {
-	for _, addr := range a.addrMap {
-		addr.spendables = addr.spendables[:0]
-	}
 	a.SpendableOutputs()
 }
 
@@ -249,9 +278,14 @@ func (a *Account) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// TODO get account numnber right.
 		fmt.Fprintf(w, "m/44'/0'/0'/0/%d: %s,  balance: %d\n<br>",
 			i, encoded, addr.Balance())
-		for _, output := range addr.spendables {
-			fmt.Fprintf(w, "Spendable tx output: %x (%d): %d satoshi\n<br>",
-				output.TxHash(), output.Index(), output.Value)
+		for _, s := range addr.spendables {
+			fmt.Fprintf(w, "Spendable output from tx %x (fingerprint):<br>",
+				s.outputs[0].TxFingerprint())
+			for _, o := range s.outputs {
+				fmt.Fprintf(w, "tx %x (hash, internal byte order) (index %d): "+
+					"%d satoshi\n<br>",
+					utils.ReverseBytes(o.TxHash()), o.Index(), o.Value)
+			}
 		}
 	}
 	fmt.Fprintf(w, "\n<p>Change addresses:</p>\n")
@@ -262,9 +296,14 @@ func (a *Account) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		// TODO get account numnber right.
 		fmt.Fprintf(w, "m/44'/0'/0'/1/%d: %s,  balance: %d\n<br>",
 			i, encoded, addr.Balance())
-		for _, output := range addr.spendables {
-			fmt.Fprintf(w, "Spendable tx output: %x (%d): %d satoshi\n<br>",
-				output.TxHash(), output.Index(), output.Value)
+		for _, s := range addr.spendables {
+			fmt.Fprintf(w, "Spendable output from tx %x (fingerprint):<br>",
+				s.outputs[0].TxFingerprint())
+			for _, o := range s.outputs {
+				fmt.Fprintf(w, "tx %x (hash, internal byte order) (index %d): "+
+					"%d satoshi\n<br>",
+					utils.ReverseBytes(o.TxHash()), o.Index(), o.Value)
+			}
 		}
 	}
 }

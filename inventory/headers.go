@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/aarbt/bitcoin-network"
-	"github.com/aarbt/bitcoin-wallet/database"
 	"github.com/aarbt/bitcoin-wallet/messages"
 	"github.com/aarbt/bitcoin-wallet/utils"
 )
@@ -17,13 +16,13 @@ type HeaderGetter struct {
 	inv    *Inventory
 	input  chan network.Message
 	output chan *messages.ExtendedHeader
-	db     *database.DB
+	db     Database
 
 	closeCh chan struct{}
 	doneCh  chan struct{}
 }
 
-func GetHeaders(inv *Inventory, db *database.DB) *HeaderGetter {
+func GetHeaders(inv *Inventory, db Database) *HeaderGetter {
 	getter := HeaderGetter{
 		inv: inv,
 		db:  db,

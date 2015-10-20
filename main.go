@@ -106,20 +106,25 @@ func main() {
 
 	sendPayment := func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/html")
+		r.ParseForm()
 		if config.Wallet != nil {
-			var tx *messages.Transaction
-			if txHex := r.FormValue("tx"); txHex != "" {
-				txSer, err := hex.DecodeString(txHex)
-				if err != nil {
-					fmt.Fprintf(w, "Error parsing transaction hex %q: %v",
-						txHex, err)
-					return
-				}
-				tx, err = messages.ParseTransaction(txSer)
-				if err != nil {
-					fmt.Fprintf(w, "Error parsing transaction %x: %v",
-						txSer, err)
-					return
+			var transactions []*messages.Transaction
+			txHexes := r.Form["tx"]
+			if len(txHexes) > 0 {
+				for _, txHex := range txHexes {
+					txSer, err := hex.DecodeString(txHex)
+					if err != nil {
+						fmt.Fprintf(w, "Error parsing transaction hex %q: %v",
+							txHex, err)
+						return
+					}
+					tx, err := messages.ParseTransaction(txSer)
+					if err != nil {
+						fmt.Fprintf(w, "Error parsing transaction %x: %v",
+							txSer, err)
+						return
+					}
+					transactions = append(transactions, tx)
 				}
 			} else {
 
@@ -151,27 +156,39 @@ func main() {
 					fmt.Fprintf(w, "Error signing transaction: %v", err)
 					return
 				}
-				tx = payment.Transaction()
+				transactions = payment.Transactions()
 			}
-			fmt.Fprintf(w, "<font face=\"courier\">Transaction: %s</font>",
-				strings.Replace(tx.String(), "\n", "<br/>", -1))
-			verified, err := i.VerifyTransaction(tx)
-			if err != nil {
-				fmt.Fprintf(w, "Error verifying transaction: %v", err)
-				return
+			if len(transactions) > 1 {
+				fmt.Fprintf(w, "Using duplicate transactions to cope "+
+					"with duplicate inputs.<br><br>")
 			}
-			fmt.Fprintf(w, "<br><b>Signatures verified: %v</b>", verified)
+			for _, tx := range transactions {
+				fmt.Fprintf(w, "<font face=\"courier\">Transaction: %s</font><br>",
+					strings.Replace(tx.String(), "\n", "<br/>", -1))
+				verified, err := i.VerifyTransaction(tx)
+				if err != nil || !verified {
+					fmt.Fprintf(w, "Error verifying transaction: %v", err)
+					return
+				}
+				fmt.Fprintf(w, "<br><b>Signatures verified!</b><br><br>")
+			}
 			if r.FormValue("send") == "true" {
-				n.SendChannel() <- network.Message{
-					Type: "tx",
-					Data: tx.Data(),
+				for _, tx := range transactions {
+					n.SendChannel() <- network.Message{
+						Type: "tx",
+						Data: tx.Data(),
+					}
 				}
 				n.SendChannel() <- network.Message{
 					Type: "mempool",
 				}
 			} else {
-				fmt.Fprintf(w, "<br><br><a href=\"?tx=%x&send=true\">"+
-					"Broadcast transaction</a>", tx.Data())
+				str := "<br><br><a href=\"?"
+				for _, tx := range transactions {
+					str += fmt.Sprintf("tx=%x&", tx.Data())
+				}
+				str += "send=true\">Broadcast transaction(s)</a>"
+				fmt.Fprintf(w, str)
 			}
 		} else {
 			fmt.Fprintf(w, "No wallet configured.")

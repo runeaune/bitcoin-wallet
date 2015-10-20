@@ -2,18 +2,15 @@ package inventory
 
 import (
 	"bytes"
-	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"log"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
 	"github.com/aarbt/bitcoin-base58"
 	"github.com/aarbt/bitcoin-network"
-	"github.com/aarbt/bitcoin-wallet/database"
 	"github.com/aarbt/bitcoin-wallet/messages"
 	"github.com/aarbt/bitcoin-wallet/script"
 	"github.com/aarbt/bitcoin-wallet/utils"
@@ -25,7 +22,8 @@ var kHighestKnownBlock = []byte("last header")
 type Inventory struct {
 	input        chan network.Message
 	output       chan<- network.Message
-	data         map[string]*Data
+	txHashes     map[string]*TxVersion   // maps from hash.
+	transactions map[string]*Transaction // maps from id/fingerprint.
 	closeCh      chan struct{}
 	doneCh       chan struct{}
 	bestEndpoint string
@@ -39,33 +37,18 @@ type Inventory struct {
 	confedEndpoints map[string]bool
 }
 
+type Database interface {
+	LoadAllTransactions() []*TxVersion
+	StoreNewTransaction(*TxVersion)
+	Set([]byte, interface{})
+	Get([]byte, interface{}) error
+	Close()
+}
+
 type Config struct {
 	Wallet   *wallet.Wallet
-	Database *database.DB
+	Database Database
 	Network  Network
-}
-
-type TxOutput struct {
-	output  *messages.TxOutput
-	index   uint32
-	data    *Data
-	spentBy *Data
-}
-
-func Fingerprint(hash []byte, i uint32) []byte {
-	var b bytes.Buffer
-	binary.Write(&b, binary.LittleEndian, i)
-	return append(hash, b.Bytes()...)
-}
-
-// Fingerprint returns a unique identifier of the output.
-func (out *TxOutput) Fingerprint() []byte {
-	return Fingerprint(out.data.Hash, out.index)
-}
-
-// TxHash returns the hash of the transaction the output belongs to.
-func (out *TxOutput) TxHash() []byte {
-	return out.data.Hash
 }
 
 type Network interface {
@@ -78,9 +61,14 @@ type Network interface {
 func New(config *Config) *Inventory {
 	inv := Inventory{
 		// TODO figure out a better way to avoid dropping messages.
-		input:           make(chan network.Message, 2000),
-		closeCh:         make(chan struct{}),
-		doneCh:          make(chan struct{}),
+		input: make(chan network.Message, 2000),
+
+		closeCh: make(chan struct{}),
+		doneCh:  make(chan struct{}),
+
+		txHashes:     make(map[string]*TxVersion),
+		transactions: make(map[string]*Transaction),
+
 		outputs:         make(map[string]*TxOutput),
 		filter:          NewFilter(),
 		config:          config,
@@ -94,6 +82,9 @@ func New(config *Config) *Inventory {
 	}
 	inv.output = config.Network.SendChannel()
 
+	if config.Database != nil {
+		inv.loadTransactions(config.Database)
+	}
 	// Loop until all addresses have been added to the filter. This might
 	// need more than one round in situations where the database contains
 	// transactions to addresses near the end of the initial address list.
@@ -102,26 +93,28 @@ func New(config *Config) *Inventory {
 		// Add objects relevant to the wallet to our filter.
 		if config.Wallet != nil {
 			for _, o := range config.Wallet.WatchObjects() {
-				encoded, _ := base58.BitcoinCheckEncode(
-					base58.BitcoinPublicKeyHashPrefix, o)
-				log.Printf("Watching %x %s", o, encoded)
 				inv.filter.Watch(o, filterMayNeedUpdate)
 			}
 		}
 
 		// Load known transactions from database.
 		if config.Database != nil {
-			inv.data = LoadTransactions(config.Database)
-
 			// Add the transactions we're watching to the filter.
-			for hash, _ := range inv.data {
-				inv.filter.Watch([]byte(hash), filterMayNeedUpdate)
+			for hash, version := range inv.txHashes {
+				if version.Block != nil {
+					inv.transactionVersionConfirmed(version)
+				}
+				if version.InvalidatedBy == nil {
+					inv.filter.Watch([]byte(hash), filterMayNeedUpdate)
+				}
 			}
 			// Create/update list of unspent tx outputs. This relies on the
 			// filter being up-to-date.
-			for _, data := range inv.data {
-				// This might add new addresses to wallet.
-				inv.UpdateTxOutputs(data)
+			for _, version := range inv.txHashes {
+				if version.InvalidatedBy == nil {
+					// This might add new addresses to wallet.
+					inv.UpdateTxOutputs(version)
+				}
 			}
 		}
 		if config.Wallet != nil {
@@ -158,19 +151,23 @@ func (inv *Inventory) UnspentTxOutputs() []*messages.TxOutput {
 // UpdateTxOutputs updates the list of unspent transaction outputs Inventory is
 // watching. It also alerts attached wallets about new transaction to aid their
 // discovery process.
-func (inv *Inventory) UpdateTxOutputs(data *Data) {
+func (inv *Inventory) UpdateTxOutputs(version *TxVersion) error {
 	// TODO protect against races.
-	tx := data.TX
+	tx := version.tx
+	if tx == nil {
+		return fmt.Errorf("Input has no transaction associated with it.")
+	}
+	id := tx.Fingerprint()
 
 	// Check if new transaction spends one of our unspent outputs.
-	for index, i := range tx.Inputs {
+	for _, i := range tx.Inputs {
 		prev := i.PreviousOutput
-		id := Fingerprint(prev.Hash, prev.Index)
-		out, found := inv.outputs[string(id)]
+		outputId := Fingerprint(prev.Hash, prev.Index)
+		out, found := inv.outputs[string(outputId)]
 		if found {
-			log.Printf("Output %d of tx %x spent by input %d of tx %x.",
-				prev.Index, out.TxHash(), index, tx.Hash())
-			out.spentBy = data
+			//			log.Printf("Output %d of tx %x spent by input %d of tx %x.",
+			//				prev.Index, out.TxHash(), index, tx.Hash())
+			out.spentBy = tx
 		}
 	}
 
@@ -183,16 +180,18 @@ func (inv *Inventory) UpdateTxOutputs(data *Data) {
 				// This is an exact match, but not just for
 				// public address hashes. Either way, it's
 				// highly likely that this is an output that we
-				// can spend, so add it to the list.
+				// can spend, so add it to the list and let the
+				// wallets filter out the ones they can spend.
 				encoded, _ := base58.BitcoinCheckEncode(
 					base58.BitcoinPublicKeyHashPrefix, addr)
-				log.Printf("Transaction %x pays address %s",
-					utils.ReverseBytes(tx.Hash()), encoded)
 				output := TxOutput{
 					index:  uint32(index),
 					output: o,
-					data:   data,
+					tx:     version,
+					id:     id,
 				}
+				log.Printf("Transaction hash %x pays address %s with output %x",
+					utils.ReverseBytes(tx.Hash()), encoded, output.Fingerprint())
 				inv.outputs[string(output.Fingerprint())] = &output
 				outputs = append(outputs, &output)
 
@@ -203,23 +202,24 @@ func (inv *Inventory) UpdateTxOutputs(data *Data) {
 		}
 	}
 
-	// Check if we already know a transaction that spend the new outputs.
+	// Check if we already know a transaction that spends the new outputs.
 	for _, o := range outputs {
-		for _, data := range inv.data {
-			t := data.TX
+		for _, version := range inv.txHashes {
+			t := version.tx
 			if t == nil {
 				continue
 			}
-			for index, i := range t.Inputs {
+			for _, i := range t.Inputs {
 				prev := i.PreviousOutput
 				if bytes.Equal(prev.Hash, o.TxHash()) && prev.Index == o.index {
-					log.Printf("Output %x(%d) already spent by input %x(%d).",
-						o.TxHash(), prev.Index, t.Hash(), index)
-					o.spentBy = data
+					//					log.Printf("Output %x(%d) already spent by input %x(%d).",
+					//						o.TxHash(), prev.Index, t.Hash(), index)
+					o.spentBy = t
 				}
 			}
 		}
 	}
+	return nil
 }
 
 func (inv *Inventory) Close() {
@@ -251,42 +251,95 @@ func (inv *Inventory) Unsubscribe(d dispatcher) {
 	d.Unsubscribe("version")
 }
 
-// TODO Clean up this function.
-func (inv *Inventory) addDataToInventory(hash []byte,
-	tx *messages.Transaction, block *database.Block) *Data {
+func (inv *Inventory) transactionVersionConfirmed(conf *TxVersion) {
+	if conf.Id() == nil {
+		// Lacks body, no way to find duplicates.
+		return
+	}
+	tx := inv.transactions[string(conf.Id())]
+	for _, version := range tx.versions {
+		if !bytes.Equal(version.Hash(), conf.tx.Hash()) {
+			// TODO Invalidate any transactions with this one as input.
+			txVersion, found := inv.txHashes[string(version.Hash())]
+			if found && txVersion.InvalidatedBy == nil {
+				txVersion.InvalidatedBy = conf.tx.Hash()
+				inv.config.Database.StoreNewTransaction(txVersion)
+				for index, _ := range version.Outputs {
+					outputId := Fingerprint(version.Hash(), uint32(index))
+					_, found := inv.outputs[string(outputId)]
+					if found {
+						delete(inv.outputs, string(outputId))
+					}
+				}
+			}
+		}
+	}
+}
 
-	var save bool
-	data, found := inv.data[string(hash)]
+// addTxBlock indicates that a transaction hash has been included in a block.
+func (inv *Inventory) addTxBlock(hash []byte, block *Block) {
+	version, found := inv.txHashes[string(hash)]
 	if !found {
-		log.Printf("Transaction %x added to inventory.\n", hash)
-		data = NewData(hash)
-		inv.data[string(hash)] = data
+		// Hash seen in block before TX arrived.
+		version = &TxVersion{Hash: hash}
+		inv.txHashes[string(hash)] = version
 	}
-	if tx != nil {
-		if data.TX == nil {
-			data.TX = tx
-			save = true
-			inv.UpdateTxOutputs(data)
+	if version.Block == nil {
+		log.Printf("Adding block %x to transaction hash %x.",
+			block.Hash, hash)
+		version.Block = block
+		inv.config.Database.StoreNewTransaction(version)
+		inv.transactionVersionConfirmed(version)
+	}
+	if version.Id() != nil {
+		tx := inv.transactions[string(version.Id())]
+		if tx.block == nil {
+			tx.block = block
 		}
 	}
-	if block != nil {
-		if data.Block == nil {
-			data.Block = block
-			save = true
+	// Add hash to filter. Remote nodes will do the same, so there's
+	// no need to update them.
+	inv.filter.Watch(hash, filterNoUpdateNeeded)
+}
+
+func (inv *Inventory) addTxData(hash []byte, data *messages.Transaction) {
+	version, found := inv.txHashes[string(hash)]
+	if !found {
+		id := data.Fingerprint()
+		log.Printf("Adding transaction hash %x for transaction %x", hash, id)
+		version = &TxVersion{Hash: hash, tx: data}
+		inv.txHashes[string(hash)] = version
+		inv.config.Database.StoreNewTransaction(version)
+	} else if version.tx == nil {
+		version.tx = data
+		inv.config.Database.StoreNewTransaction(version)
+		if version.Block != nil {
+			// This tx was confirmed earlier, but couldn't
+			// invalidate duplicates until now; confirm it again.
+			inv.transactionVersionConfirmed(version)
 		}
-		// TODO Check that block hasn't changed.
 	}
-	if save && data.TX != nil {
-		inv.config.Database.StoreNewTransaction(&database.Transaction{
-			Data:  data.TX.Serialize(),
-			Block: data.Block,
-		})
+	tx, found := inv.transactions[string(version.Id())]
+	if !found {
+		log.Printf("Adding hash %x to transaction %x", hash, version.Id())
+		tx = &Transaction{
+			id:        version.Id(),
+			timestamp: time.Now(),
+			versions:  make(map[string]*messages.Transaction),
+			block:     version.Block,
+		}
+		inv.transactions[string(version.Id())] = tx
+	} else if tx.block != nil {
+		// Another version of this transaction has already been confirmed.
+		return
 	}
+	tx.versions[string(hash)] = data
+	inv.UpdateTxOutputs(version)
+
 	// Add transaction to filter. Remote nodes will do the same, so there's
 	// no need to update them.
 	inv.filter.Watch(hash, filterNoUpdateNeeded)
 	// TODO verify TX
-	return data
 }
 
 func (inv *Inventory) Send(m network.Message) string {
@@ -312,10 +365,18 @@ func (inv *Inventory) SendGetData(vector messages.InventoryVector, addrHint stri
 		if err != nil {
 			return fmt.Errorf("Failed to encode getdata vector: %v", err)
 		}
-		inv.Send(network.Message{
-			Type: "getdata",
-			Data: data,
-		})
+		if addrHint != "" {
+			inv.output <- network.Message{
+				Type:     "getdata",
+				Data:     data,
+				Endpoint: addrHint,
+			}
+		} else {
+			inv.Send(network.Message{
+				Type: "getdata",
+				Data: data,
+			})
+		}
 	}
 	return nil
 }
@@ -367,7 +428,7 @@ func (inv *Inventory) handleTransaction(tx *messages.Transaction) {
 	} else {
 		log.Printf("Received transaction %x matching the filter: %x", tx.Hash(), tx.Data())
 	}
-	inv.addDataToInventory(tx.Hash(), tx, nil)
+	inv.addTxData(tx.Hash(), tx)
 
 	w := inv.config.Wallet
 	if w != nil {
@@ -399,13 +460,16 @@ func (inv *Inventory) handleInvMessage(m network.Message) {
 		if i.Type == messages.TypeMsgTX {
 			hash := string(i.Hash)
 			log.Printf("Received inventory message with tx: %x from %q", hash, m.Endpoint)
-			data, found := inv.data[hash]
+			version, found := inv.txHashes[hash]
 			if !found {
-				data = NewData(i.Hash)
-				inv.data[hash] = data
+				version = &TxVersion{
+					Hash: i.Hash,
+				}
+				inv.txHashes[hash] = version
 				vector = append(vector, i)
 			}
-			data.AddPeer(m.Endpoint)
+			// TODO keep track of peers that have relayed inv messages.
+			//data.AddPeer(m.Endpoint)
 		} else if i.Type == messages.TypeMsgBlock {
 			extHeader, _ := inv.headers.loadHeader(i.Hash)
 			if extHeader == nil {
@@ -487,7 +551,7 @@ func (inv *Inventory) handleMerkleBlock(m network.Message) {
 		}
 		// Store transactions even if we couldn't get correct height.
 		// TODO Update height value once we figure it out.
-		short := database.Block{
+		short := Block{
 			Hash:      block.Hash(),
 			Timestamp: time.Unix(int64(block.Timestamp), 0),
 			Height:    int32(height),
@@ -495,7 +559,7 @@ func (inv *Inventory) handleMerkleBlock(m network.Message) {
 		// Attach block information to transactions
 		for _, tx := range root.MatchedTransactions() {
 			// TODO Check against local filter.
-			inv.addDataToInventory(tx, nil, &short)
+			inv.addTxBlock(tx, &short)
 		}
 	}
 }
@@ -540,27 +604,32 @@ func (inv *Inventory) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	path := r.URL.Path[len("/inventory/"):]
 	if path == "" {
 		w.Header().Set("Content-Type", "text/html")
-		list := make([]*Data, 0, len(inv.data))
-		for _, data := range inv.data {
-			list = append(list, data)
+		list := make([]*Transaction, 0, len(inv.transactions))
+		for _, tx := range inv.transactions {
+			list = append(list, tx)
 		}
 		fmt.Fprintf(w, "Transactions (%d):<br>\n", len(list))
-		sort.Sort(DataListByTime(list))
-		for _, data := range list {
-			fmt.Fprintf(w, "<a href=\"tx/%s\">%s</a><br>\n",
-				hex.EncodeToString(data.Hash), data)
+		//sort.Sort(DataListByTime(list))
+		for _, tx := range list {
+			fmt.Fprintf(w, "%x (%s)<br>\n", tx.id, tx.timestamp)
+			i := 0
+			for _, version := range tx.versions {
+				fmt.Fprintf(w, "%d: <a href=\"tx/%x\">%x</a><br>\n",
+					i, version.Hash(), version.Hash())
+				i++
+			}
 		}
 	} else if strings.HasPrefix(path, "tx") {
 		w.Header().Set("Content-Type", "text/plain")
 		key := path[len("tx/"):]
 		fmt.Fprintf(w, "TX: %s\n", key)
 		hash, _ := hex.DecodeString(key)
-		inv, found := inv.data[string(hash)]
+		version, found := inv.txHashes[string(hash)]
 		if found {
-			fmt.Fprintf(w, "%s\n\nRelayed by:\n", inv.TX)
-			for _, peer := range inv.Peers() {
-				fmt.Fprintf(w, "%s\n", peer)
-			}
+			fmt.Fprintf(w, "%s\n\nRelayed by:\n", version.tx)
+			//for _, peer := range inv.Peers() {
+			//	fmt.Fprintf(w, "%s\n", peer)
+			//}
 		} else {
 			fmt.Fprintf(w, "Couldn't find TX %q.", key)
 		}
@@ -576,11 +645,11 @@ func (inv *Inventory) VerifyTransaction(tx *messages.Transaction) (bool, error) 
 			return false, fmt.Errorf("Failed to push signature: %v", err)
 		}
 		prev := input.PreviousOutput
-		d, found := inv.data[string(prev.Hash)]
+		d, found := inv.txHashes[string(prev.Hash)]
 		if !found {
 			return false, fmt.Errorf("Input tx %x not found in map.", prev.Hash)
 		}
-		inputTx := d.TX
+		inputTx := d.tx
 		output := inputTx.Outputs[prev.Index]
 		inputValue += output.Value
 

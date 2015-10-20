@@ -1,17 +1,17 @@
 package database
 
 import (
-	"bytes"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log"
-	"time"
+
+	// TODO Break dependencies on inventory.
+	"github.com/aarbt/bitcoin-wallet/inventory"
 
 	"github.com/golang/leveldb"
 )
 
-const kTxStoragePrefix = "TX: "
+const kTxStoragePrefix = "tx: "
 
 // TODO Compress storage format. Speed up by using batching.
 
@@ -53,7 +53,7 @@ func (db *DB) Get(key []byte, data interface{}) error {
 
 	err = json.Unmarshal(j, data)
 	if err != nil {
-		return fmt.Errorf("Failed to parse extended header %x in db: %v",
+		return fmt.Errorf("Failed to parse data on key %x in db: %v",
 			key, err)
 	}
 	return nil
@@ -64,22 +64,25 @@ func (db *DB) Get(key []byte, data interface{}) error {
 // This is considered to be all stored transactions. It does not check for
 // duplicates. If duplicates are found, the later one should be used.
 // TODO Find a better way to store transactions.
-func (db *DB) LoadAllTransactions() []*Transaction {
-	var list []*Transaction
+func (db *DB) LoadAllTransactions() []*inventory.TxVersion {
+	var list []*inventory.TxVersion
 	db.transactionCount = 0
 	for {
 		key := fmt.Sprintf(kTxStoragePrefix+"%x", db.transactionCount)
-		data, err := db.db.Get([]byte(key), nil)
-		if err != nil || len(data) == 0 {
+		t := &inventory.TxVersion{}
+		err := db.Get([]byte(key), t)
+		if err != nil {
 			log.Printf("Transaction #%d not in storage: %v",
 				db.transactionCount, err)
 			break
 		}
-		db.transactionCount++
-		tx := ParseTransaction(data)
-		if tx != nil {
-			list = append(list, tx)
+		err = t.DeserializeTransaction()
+		if err != nil {
+			log.Println(err)
+			break
 		}
+		db.transactionCount++
+		list = append(list, t)
 	}
 	return list
 }
@@ -87,17 +90,15 @@ func (db *DB) LoadAllTransactions() []*Transaction {
 // Only call after LoadAllTransactions has completed. Due to how difficult it
 // is to update transactions after the fact, duplicates storage of the same
 // transaction is fine as long as they are incrementally more complete/correct.
-func (db *DB) StoreNewTransaction(tx *Transaction) {
+func (db *DB) StoreNewTransaction(tx *inventory.TxVersion) {
 	key := fmt.Sprintf(kTxStoragePrefix+"%x", db.transactionCount)
-	err := db.db.Set([]byte(key), tx.Serialize(), nil)
-	if err != nil {
-		log.Printf("Failed to insert transaction %x into database: %v",
-			key, err)
-	}
+	tx.SerializeTransaction()
+	db.Set([]byte(key), tx)
 	db.transactionCount++
 	log.Printf("Stored transaction, total is %d.", db.transactionCount)
 }
 
+/*
 type Block struct {
 	Hash      []byte    // 32 bytes
 	Timestamp time.Time // 4 bytes
@@ -151,3 +152,4 @@ func ParseTransaction(data []byte) *Transaction {
 	}
 	return &t
 }
+*/

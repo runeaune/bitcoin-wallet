@@ -29,8 +29,8 @@ func NewMockInventory() *MockInventory {
 	inv := &MockInventory{
 		inv: make(map[string]*messages.Transaction),
 	}
-	inv.inv[string(parsed1.Hash)] = parsed1
-	inv.inv[string(parsed2.Hash)] = parsed2
+	inv.inv[string(parsed1.Hash())] = parsed1
+	inv.inv[string(parsed2.Hash())] = parsed2
 	return inv
 }
 
@@ -67,7 +67,12 @@ func TestPayments(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to sign payment: %v", err)
 	}
-	tx := pay.Transaction()
+	transactions := pay.Transactions()
+	if len(transactions) != 1 {
+		t.Errorf("Bad number of transactions, got %d expected 1.",
+			len(transactions))
+	}
+	tx := transactions[0]
 
 	for index, input := range tx.Inputs {
 		stack := script.Stack{}

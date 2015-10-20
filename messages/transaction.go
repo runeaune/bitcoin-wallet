@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
 	"fmt"
 	"io"
 	"log"
@@ -32,15 +31,18 @@ type Transaction struct {
 
 	// The following parameters are calculated locally and are not in
 	// protocol messages.
-	hash []byte
-	data []byte
+	hash        []byte
+	data        []byte
+	fingerprint []byte
 }
 
 // Fingerprint returns a fingerprint that is unique for each tx but doen't
-// include the signature (or other things that can be changed after broadcast).
-func (t *Transaction) Fingerprint() string {
-	// TODO Actually disregard signature when making the fingerprint.
-	return hex.EncodeToString(t.Hash())
+// include the signatures (or other things that can be changed after broadcast).
+func (t *Transaction) Fingerprint() []byte {
+	if t.fingerprint == nil {
+		t.fingerprint = utils.DoubleHash(t.SerializeWithoutSignature())
+	}
+	return t.fingerprint
 }
 
 func (t *Transaction) Data() []byte {
@@ -86,6 +88,21 @@ func (t *Transaction) Serialize() []byte {
 		t.data = t.SignSerialize(-1, nil, 0)
 	}
 	return t.data
+}
+
+func (t *Transaction) SerializeWithoutSignature() []byte {
+	b := new(bytes.Buffer)
+	binary.Write(b, binary.LittleEndian, t.Version)
+	WriteCompactUint(uint(len(t.Inputs)), b)
+	for _, in := range t.Inputs {
+		b.Write(in.SerializeWithoutSignature())
+	}
+	WriteCompactUint(uint(len(t.Outputs)), b)
+	for _, o := range t.Outputs {
+		b.Write(o.Serialize())
+	}
+	binary.Write(b, binary.LittleEndian, t.LockTime)
+	return b.Bytes()
 }
 
 const (
@@ -240,6 +257,7 @@ func (i *TxInput) Index() uint {
 	return uint(i.PreviousOutput.Index)
 }
 
+// Serialize returns the serialized version of the input as described by the protocol.
 func (i *TxInput) Serialize() []byte {
 	b := &bytes.Buffer{}
 	b.Write(i.PreviousOutput.Serialize())
@@ -248,6 +266,11 @@ func (i *TxInput) Serialize() []byte {
 	return b.Bytes()
 }
 
+// SignSerialize returns the serialized version of the input, as required for
+// signing the transaction. If a subscript is provided, it will be put in the
+// place of the signature, if not provided the signature field will be left
+// empty. If nilSequence is true, the sequence number will be set to 0,
+// otherwise left as-is.
 func (i *TxInput) SignSerialize(subscript []byte, nilSequence bool) []byte {
 	b := &bytes.Buffer{}
 	b.Write(i.PreviousOutput.Serialize())
@@ -262,6 +285,13 @@ func (i *TxInput) SignSerialize(subscript []byte, nilSequence bool) []byte {
 		binary.Write(b, binary.LittleEndian, i.Sequence)
 	}
 	return b.Bytes()
+}
+
+// SerializeWithoutSignature serializes the input, leaving the signature field
+// empty. This is intended to just cover the fields not affected by transaction
+// malleability.
+func (i *TxInput) SerializeWithoutSignature() []byte {
+	return i.SignSerialize(nil, false)
 }
 
 func parseTxInput(b io.Reader) (*TxInput, error) {
@@ -401,9 +431,26 @@ func (o TxOutput) TxHash() []byte {
 	}
 }
 
+func (o TxOutput) TxFingerprint() []byte {
+	if o.tx != nil {
+		return o.tx.Fingerprint()
+	} else {
+		return []byte{0x00}
+	}
+}
+
 // Index returns the index of the output in its transaction.
 func (o TxOutput) Index() uint32 {
 	return o.index
+}
+
+// Fingerprint returns a unique identifier of the transaction (unique across
+// modified versions) and the output.
+func (o TxOutput) Fingerprint() []byte {
+	b := &bytes.Buffer{}
+	b.Write(o.TxFingerprint())
+	binary.Write(b, binary.LittleEndian, o.index)
+	return b.Bytes()
 }
 
 func ParseTxOutput(b io.Reader) (*TxOutput, error) {
