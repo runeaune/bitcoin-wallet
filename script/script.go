@@ -20,6 +20,7 @@ const (
 	OP_LENGTH_1       = 0x01
 	OP_LENGTH_MAX     = 0x4b
 	OP_VERIFY         = 0x69
+	OP_RETURN         = 0x6a
 	OP_DUP            = 0x76
 	OP_XOR            = 0x86
 	OP_EQUAL          = 0x87
@@ -35,6 +36,10 @@ func (o OpCode) String() string {
 	switch o {
 	case OP_0:
 		return "OP_0"
+	case OP_VERIFY:
+		return "OP_VERIFY"
+	case OP_RETURN:
+		return "OP_RETURN"
 	case OP_DUP:
 		return "OP_DUP"
 	case OP_RIPEMD160:
@@ -380,26 +385,7 @@ func ParseScript(script []byte) string {
 			}
 			continue
 		}
-		switch b {
-		case OP_0:
-			str += "OP_0 "
-		case OP_DUP:
-			str += "OP_DUP "
-		case OP_RIPEMD160:
-			str += "OP_RIPEMD160 "
-		case OP_HASH160:
-			str += "OP_HASH160 "
-		case OP_EQUAL:
-			str += "OP_EQUAL "
-		case OP_EQUALVERIFY:
-			str += "OP_EQUALVERIFY "
-		case OP_CODESEPARATOR:
-			str += "OP_CODESEPARATOR "
-		case OP_CHECKSIG:
-			str += "OP_CHECKSIG "
-		default:
-			str += fmt.Sprintf("0x%x ", b)
-		}
+		str += OpCode(b).String() + " "
 	}
 	return str
 }
@@ -440,6 +426,18 @@ func PayToPubKeyHash(hash []byte) ([]byte, error) {
 	return s, nil
 }
 
+func ArbitraryData(data []byte) ([]byte, error) {
+	if len(data) > 40 {
+		return nil, fmt.Errorf("Data %x is too big at %d bytes.",
+			data, len(data))
+	}
+	s := make([]byte, 2+len(data))
+	s[0] = OP_RETURN
+	s[1] = byte(len(data))
+	copy(s[2:], data)
+	return s, nil
+}
+
 func SigScriptEncode(sig, pubKey []byte) []byte {
 	data := make([]byte, 2+len(sig)+len(pubKey))
 	data[0] = byte(len(sig))
@@ -447,44 +445,4 @@ func SigScriptEncode(sig, pubKey []byte) []byte {
 	data[1+len(sig)] = byte(len(pubKey))
 	copy(data[2+len(sig):], pubKey)
 	return data
-}
-
-func VerifyScriptSig(script []byte) bool {
-	s := Stack{}
-	buf := bytes.NewBuffer(script)
-	for {
-		o := Object{}
-		b, err := buf.ReadByte()
-		if err != nil {
-			break
-		}
-		if b >= OP_LENGTH_1 && b <= OP_LENGTH_MAX {
-			data := make([]byte, b)
-			n, err := buf.Read(data)
-			if err != nil || n != len(data) {
-				o.err = err
-				continue
-			}
-			o.data = data
-			s.Push(o)
-		} else {
-			var err error
-			switch b {
-			case OP_DUP:
-				err = FuncOP_DUP(&s)
-			case OP_HASH160:
-				err = FuncOP_HASH160(&s)
-			case OP_EQUAL:
-				err = FuncOP_EQUAL(&s)
-			case OP_EQUALVERIFY:
-				err = FuncOP_EQUALVERIFY(&s)
-			case OP_CHECKSIG:
-			default:
-			}
-			if err != nil {
-				return false
-			}
-		}
-	}
-	return true
 }

@@ -114,7 +114,7 @@ func (p *Payment) AddInputsAndFee(fee uint64) error {
 	return nil
 }
 
-// AddOutputToPayment adds a standard pay to public key hash output to a payment transaction.
+// AddOutput adds a standard pay to public key hash output to a payment transaction.
 func (p *Payment) AddOutput(addrHash []byte, value uint64) error {
 	s, err := script.PayToPubKeyHash(addrHash)
 	if err != nil {
@@ -122,6 +122,18 @@ func (p *Payment) AddOutput(addrHash []byte, value uint64) error {
 	}
 	p.tx.AddOutput(&messages.TxOutput{
 		Value:  value,
+		Script: s,
+	})
+	return nil
+}
+
+// AddDataOutput adds up to 40 bytes of arbitrary data using the OP_RETURN op code.
+func (p *Payment) AddDataOutput(data []byte) error {
+	s, err := script.ArbitraryData(data)
+	if err != nil {
+		return err
+	}
+	p.tx.AddOutput(&messages.TxOutput{
 		Script: s,
 	})
 	return nil
